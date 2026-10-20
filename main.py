@@ -43,7 +43,7 @@ from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import StrategyEngine
 from utils import (TradeSide, is_force_square_off_time, is_market_open,
-                    now_ist_time, _get_current_session,
+                    now_ist_time,
                     )
 
 _log = get_logger("main")
@@ -281,7 +281,11 @@ class TradingBot:
 
         signal = self.strategy.evaluate(closed_5m, closed_15m, vwap_series, symbol="NIFTY")
         if signal.side in (TradeSide.LONG, TradeSide.SHORT):
-            if CONFIG.session.enable_time_based_entry_gate and now_ist_time() < CONFIG.session.first_entry_time:
+            if CONFIG.session.enable_time_based_entry_gate and now_ist_time() < CONFIG.session.setup_scan_start:
+                return
+            allowed, adx_reason = self.risk.adx_band_allows(signal.adx)
+            if not allowed:
+                _log.info("Entry blocked by ADX band: %s", adx_reason)
                 return
             self._execute_signal(signal)
 
@@ -311,30 +315,33 @@ class TradingBot:
 
         premium = self._get_option_ltp(contract.tradingsymbol) or 0.0
         equity = self.risk.equity
+
+        # All distances are OPTION PREMIUM points, applied directly to the
+        # option's live premium. No index-to-premium conversion.
+        sl_distance = abs(signal.entry_price - signal.stop_loss)
+        target_distance = abs(signal.target - signal.entry_price)
+        if signal.side == TradeSide.LONG:
+            premium_sl = premium - sl_distance
+            premium_target = premium + target_distance
+        else:
+            premium_sl = premium + sl_distance
+            premium_target = premium - target_distance
+        premium_sl = max(premium_sl, 0.05)
+        premium_target = max(premium_target, 0.05)
+
         sizing = self.margin_mgr.size_position(
-            equity=equity, entry_price=signal.entry_price, stop_loss_price=signal.stop_loss,
+            equity=equity, entry_price=premium, stop_loss_price=premium_sl,
             option_premium=premium, lot_size=contract.lot_size,
             margin_per_lot_estimate=self._estimate_margin_per_lot(contract, premium),
         )
         if sizing.quantity <= 0:
             return
 
-        delta_approx = 0.45
-        sl_distance_index = abs(signal.entry_price - signal.stop_loss)
-        target_distance_index = abs(signal.target - signal.entry_price)
-        if signal.side == TradeSide.LONG:
-            premium_sl = premium - delta_approx * sl_distance_index
-            premium_target = premium + delta_approx * target_distance_index
-        else:
-            premium_sl = premium + delta_approx * sl_distance_index
-            premium_target = premium - delta_approx * target_distance_index
-        premium_sl = max(premium_sl, 0.05)
-
         self._active_symbol = contract.tradingsymbol
         self.order_mgr.enter_position(
             contract=contract, side=signal.side, quantity=sizing.quantity,
             entry_price=premium, stop_loss=premium_sl, target=premium_target,
-            initial_sl=delta_approx * sl_distance_index,
+            initial_sl=sl_distance, entry_adx=signal.adx,
         )
         self._subscribe_active_option(contract.instrument_token)
         send_telegram_alert("POSITION_OPEN", f"{contract.tradingsymbol} qty={sizing.quantity} side={signal.side.value}")
@@ -352,31 +359,6 @@ class TradingBot:
         while not _shutdown.is_set():
             try:
                 self.order_mgr.monitor_positions()
-
-                # Check if session profit target was hit - force close open positions
-                session = _get_current_session()
-                session_profit_target = CONFIG.strategy.session_profit_target.get(session, 0)
-                if session_profit_target > 0:
-                    realized = self.risk.stats.session_pnl.get(session, 0.0)
-
-                    # Check unrealized PnL on open positions for exact lock
-                    open_positions = self.order_mgr.get_open_positions()
-                    for pos in open_positions:
-                        ltp = self.order_mgr._get_ltp(pos.contract.tradingsymbol)
-                        if ltp is None or ltp <= 0:
-                            continue
-                        if pos.side == TradeSide.LONG:
-                            unrealized = (ltp - pos.entry_price) * pos.quantity
-                        else:
-                            unrealized = (pos.entry_price - ltp) * pos.quantity
-                        total = realized + unrealized
-                        if total >= session_profit_target:
-                            _log.info(
-                                "SESSION_PROFIT_TARGET_HIT | session=%d realized=%.2f unrealized=%.2f total=%.2f target=%.2f - force closing position",
-                                session, realized, unrealized, total, session_profit_target,
-                            )
-                            self.order_mgr.force_square_off_all()
-                            break
 
                 if is_force_square_off_time():
                     self.order_mgr.force_square_off_all()

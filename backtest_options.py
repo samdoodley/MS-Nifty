@@ -206,6 +206,10 @@ class OptionBacktestEngine:
             if signal.side == TradeSide.NONE:
                 continue
 
+            # Same ADX band the live bot uses
+            if not self.risk.adx_band_allows(signal.adx)[0]:
+                continue
+
             try:
                 contract = self._resolve_contract_for_date(signal.entry_price, signal.side, trade_date, nfo_instruments)
             except Exception as e:
@@ -254,13 +258,14 @@ class OptionBacktestEngine:
                 _log.info("Position sizing rejected on %s: %s", date_str, sizing["reason"])
                 continue
 
-            delta = CONFIG.backtest.atm_delta_approx
             sl_distance = abs(signal.entry_price - signal.stop_loss)
             target_distance = abs(signal.target - signal.entry_price)
 
-            premium_sl = entry_premium - delta * sl_distance
-            premium_target = entry_premium + delta * target_distance
+            # Distances are OPTION PREMIUM points, applied directly, matching live
+            premium_sl = entry_premium - sl_distance
+            premium_target = entry_premium + target_distance
             premium_sl = max(premium_sl, 0.05)
+            premium_target = max(premium_target, 0.05)
 
             open_trade = {
                 "contract": contract,
@@ -299,18 +304,16 @@ class OptionBacktestEngine:
         else:
             trade["lowest_favorable"] = min(trade["lowest_favorable"], current_premium)
 
+        # Single-step trailing, matching live: at +7 premium points the SL moves
+        # to lock +5. Both distances are OPTION PREMIUM points.
         profit = current_premium - entry if side == TradeSide.LONG else entry - current_premium
-        if profit >= CONFIG.trade_mgmt.trail_step_index_points and trade["initial_sl"] > 0:
-            progress = min(
-                (profit - CONFIG.trade_mgmt.trail_step_index_points) / max(1, trade["premium_target"] - entry - CONFIG.trade_mgmt.trail_step_index_points),
-                1.0,
-            )
-            trail_ratio = 8.0 - progress * (8.0 - 5.0)
-            trail_sl = entry + trade["initial_sl"] * trail_ratio / 8.0 * CONFIG.backtest.atm_delta_approx
-            if side == TradeSide.LONG:
-                trade["premium_sl"] = max(trade["premium_sl"], entry - trail_sl)
-            else:
-                trade["premium_sl"] = min(trade["premium_sl"], entry + trail_sl)
+        if (
+            CONFIG.trade_mgmt.enable_trailing_after_breakeven
+            and profit >= CONFIG.trade_mgmt.trail_trigger_premium_points
+            and trade["initial_sl"] > 0
+        ):
+            lock = CONFIG.trade_mgmt.trail_lock_premium_points
+            trade["premium_sl"] = entry + lock if side == TradeSide.LONG else entry - lock
             sl = trade["premium_sl"]
 
         hit_target = current_premium >= target if side == TradeSide.LONG else current_premium <= target

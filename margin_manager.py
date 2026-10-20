@@ -70,21 +70,18 @@ class MarginManager:
     ) -> SizingResult:
         available_margin = self.get_available_margin()
 
-        sl_distance_index_points = abs(entry_price - stop_loss_price)
-        if sl_distance_index_points <= 0:
+        # Max loss per lot is (entry premium - premium at SL) * lot_size.
+        # SL distances are in OPTION PREMIUM points, so derive the risk directly
+        # from the premium prices rather than index levels.
+        sl_premium_points = abs(entry_price - stop_loss_price)
+        if sl_premium_points <= 0:
             return SizingResult(0, 0, 0.0, 0.0, available_margin, rejected_reason="ZERO_SL_DISTANCE")
 
         risk_rupees_allowed = equity * CONFIG.sizing.risk_per_trade_pct_of_equity / 100.0
 
-        # We're buying options (never selling), so max loss per lot is
-        # approximately (option premium - premium at SL) * lot_size. We
-        # estimate premium-move-per-index-point via a simple ratio here;
-        # order_manager will still enforce the hard SL regardless.
-        premium_risk_per_lot = max(option_premium * 0.01, 0.05) * sl_distance_index_points * lot_size / \
-            max(sl_distance_index_points, 1)
-        # Fallback conservative estimate: assume premium risk roughly tracks
-        # index-point risk 1:1 scaled by lot size if delta unknown.
-        premium_risk_per_lot = max(premium_risk_per_lot, sl_distance_index_points * lot_size * 0.4)
+        # We only ever buy options, so the worst case is losing the full
+        # premium if the option goes to zero; cap risk at the SL distance.
+        premium_risk_per_lot = min(sl_premium_points, option_premium) * lot_size
 
         max_lots_by_risk = int(risk_rupees_allowed // premium_risk_per_lot) if premium_risk_per_lot > 0 else 0
 

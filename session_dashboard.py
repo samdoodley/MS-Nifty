@@ -26,7 +26,7 @@ _SERVER: ThreadingHTTPServer | None = None
 
 
 def _parse_trades() -> list[dict]:
-    """Parse all trades from journal, grouped by date and session."""
+    """Parse all completed trades from the journal, grouped by date."""
     path = _get_log_dir() / "trades.jsonl"
     if not path.exists():
         return []
@@ -48,35 +48,22 @@ def _parse_trades() -> list[dict]:
                             continue
                         t["_dt"] = dt
                         t["_date"] = dt.date().isoformat()
-                        h = dt.hour
-                        m = dt.minute
-                        if (h, m) < (13, 50):
-                            t["_session"] = 1
-                        elif (h, m) < (14, 20):
-                            t["_session"] = 2
-                        elif (h, m) < (15, 0):
-                            t["_session"] = 3
-                        else:
-                            t["_session"] = 4
                         trades.append(t)
             except json.JSONDecodeError:
                 continue
     return trades
 
 
-def _compute_session_stats(trades: list[dict]) -> dict[str, Any]:
-    """Compute per-date, per-session stats."""
-    by_date: dict[str, dict[int, dict]] = {}
+def _compute_daily_stats(trades: list[dict]) -> dict[str, Any]:
+    """Compute per-date stats."""
+    by_date: dict[str, dict] = {}
 
     for t in trades:
         date = t["_date"]
-        session = t["_session"]
         pnl = float(t.get("pnl", 0))
 
         if date not in by_date:
-            by_date[date] = {}
-        if session not in by_date[date]:
-            by_date[date][session] = {
+            by_date[date] = {
                 "trades": 0,
                 "wins": 0,
                 "losses": 0,
@@ -85,7 +72,7 @@ def _compute_session_stats(trades: list[dict]) -> dict[str, Any]:
                 "loss_pnl": 0.0,
             }
 
-        s = by_date[date][session]
+        s = by_date[date]
         s["trades"] += 1
         s["total_pnl"] += pnl
         if pnl > 0:
@@ -108,11 +95,11 @@ def _generate_html(stats: dict[str, Any]) -> str:
 
     rows = []
     for date in sorted(stats.keys(), reverse=True):
-        sessions = stats[date]
-        date_total_pnl = sum(s["total_pnl"] for s in sessions.values())
-        date_total_trades = sum(s["trades"] for s in sessions.values())
-        date_wins = sum(s["wins"] for s in sessions.values())
-        date_losses = sum(s["losses"] for s in sessions.values())
+        s = stats[date]
+        date_total_pnl = s["total_pnl"]
+        date_total_trades = s["trades"]
+        date_wins = s["wins"]
+        date_losses = s["losses"]
 
         total_trades += date_total_trades
         total_wins += date_wins
@@ -120,32 +107,21 @@ def _generate_html(stats: dict[str, Any]) -> str:
         total_pnl += date_total_pnl
 
         pnl_color = "#37f26b" if date_total_pnl >= 0 else "#ff4444"
+        win_rate = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
         rows.append(f"""
-        <tr style="background:#111;">
-            <td colspan="9" style="padding:8px;font-weight:bold;color:#37f26b;border-top:2px solid #37f26b;">
-                {date} | Total Trades: {date_total_trades} | Wins: {date_wins} | Losses: {date_losses} | Net P&L: <span style="color:{pnl_color};">₹{date_total_pnl:,.2f}</span>
-            </td>
-        </tr>""")
-
-        for session in sorted(sessions.keys()):
-            s = sessions[session]
-            win_rate = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
-            total_pnl_color = "#37f26b" if s["total_pnl"] >= 0 else "#ff4444"
-            rows.append(f"""
             <tr>
-                <td></td>
-                <td>Session {session}</td>
+                <td>{date}</td>
                 <td>{s["trades"]}</td>
                 <td>{s["wins"]}</td>
                 <td>{s["losses"]}</td>
                 <td>{win_rate:.1f}%</td>
                 <td style="color:#37f26b;">₹{s["win_pnl"]:,.2f}</td>
                 <td style="color:#ff4444;">₹{s["loss_pnl"]:,.2f}</td>
-                <td style="color:{total_pnl_color};font-weight:bold;">₹{s["total_pnl"]:,.2f}</td>
+                <td style="color:{pnl_color};font-weight:bold;">₹{s["total_pnl"]:,.2f}</td>
             </tr>""")
 
     if not rows:
-        table_rows = '<tr><td colspan="9" style="text-align:center;padding:40px;color:#777;">No trades recorded yet</td></tr>'
+        table_rows = '<tr><td colspan="8" style="text-align:center;padding:40px;color:#777;">No trades recorded yet</td></tr>'
     else:
         table_rows = "".join(rows)
 
@@ -175,7 +151,7 @@ tr:hover{{background:#122;}}
 .negative{{color:#ff4444;}}
 @media (max-width:600px){{table,th,td{{font-size:11px;padding:4px 6px;}}}}
 </style></head><body>
-<h1>📊 NIFTY Session-Wise Analytics</h1>
+<h1>📊 NIFTY Daily Analytics</h1>
 <div class="summary">
     <div class="summary-grid">
         <div class="summary-item"><div class="summary-label">Total Trades</div><div class="summary-value">{total_trades}</div></div>
@@ -189,7 +165,7 @@ tr:hover{{background:#122;}}
 <table>
 <thead>
 <tr>
-    <th>Date</th><th>Session</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win%</th>
+    <th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win%</th>
     <th>Win P&L</th><th>Loss P&L</th><th>Net P&L</th>
 </tr>
 </thead>
@@ -210,11 +186,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/stats"):
             trades = _parse_trades()
-            stats = _compute_session_stats(trades)
+            stats = _compute_daily_stats(trades)
             self._send_json(stats)
         else:
             trades = _parse_trades()
-            stats = _compute_session_stats(trades)
+            stats = _compute_daily_stats(trades)
             html = _generate_html(stats)
             self._send_html(html)
 

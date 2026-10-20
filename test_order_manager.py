@@ -393,7 +393,10 @@ class TestOrderManagerIdempotency(unittest.TestCase):
 class TestSLWatchdog(unittest.TestCase):
     def setUp(self) -> None:
         self.kite = MagicMock(spec=KiteAPI)
-        self.get_ltp = MagicMock(return_value=110.0)
+        # Keep LTP below the trailing trigger so these tests exercise only the
+        # watchdog, not the trailing SL logic.
+        trigger = CONFIG.trade_mgmt.trail_trigger_premium_points
+        self.get_ltp = MagicMock(return_value=100.0 + trigger - 0.1)
         self.mgr = OrderManager(self.kite, self.get_ltp)
         self.mgr.on_exit(lambda s, r: None)
 
@@ -757,7 +760,9 @@ class TestEntryStateFlow(unittest.TestCase):
         self.assertIn("TESTCE2", self.mgr._positions)
         self.assertEqual(self.mgr._positions["TESTCE2"].state, PositionState.ENTRY_PENDING)
 
-    def test_trailing_sl_modifies_broker_order_when_profit_exceeds_threshold(self):
+    def test_trailing_sl_moves_to_lock_5_at_7_index_points(self):
+        # 7 premium points triggers the trail, which locks 5 premium points.
+        lock = CONFIG.trade_mgmt.trail_lock_premium_points
         position = _make_position(state=PositionState.OPEN, sl_placed_at=datetime.now().isoformat())
         position.last_sl_trigger = 90.0
         with self.mgr._lock:
@@ -768,16 +773,13 @@ class TestEntryStateFlow(unittest.TestCase):
         ]
         self.kite.positions.return_value = {"net": [{"tradingsymbol": "TESTCE", "quantity": 50}]}
         self.kite.orders.return_value = []
-        self.get_ltp.return_value = 110.0
+        self.get_ltp.return_value = position.entry_price + CONFIG.trade_mgmt.trail_trigger_premium_points + 0.1
 
         self.mgr._check_position_exit(position.contract.tradingsymbol)
 
-        self.assertTrue(position.stop_loss > 90.0)
-        self.assertEqual(position.last_sl_trigger, round(position.stop_loss, 2))
-        self.kite.modify_order.assert_called_once()
-        call_kwargs = self.kite.modify_order.call_args
-        self.assertEqual(call_kwargs.kwargs["order_id"], "sl123")
-        self.assertEqual(call_kwargs.kwargs["trigger_price"], round(position.stop_loss, 2))
+        self.assertAlmostEqual(position.stop_loss, position.entry_price + lock, places=2)
+        self.assertTrue(position.trailing_sl_active)
+        self.kite.cancel_order.assert_called_once()
         self.get_ltp.return_value = 100.0
 
     def test_trailing_sl_does_not_modify_when_profit_below_threshold(self):
@@ -821,7 +823,9 @@ class TestEntryStateFlow(unittest.TestCase):
         self.kite.modify_order.assert_not_called()
         self.get_ltp.return_value = 100.0
 
-    def test_trailing_sl_short_moves_sl_to_entry_at_2pts(self):
+    def test_trailing_sl_short_locks_5_points_above_trigger(self):
+        lock = CONFIG.trade_mgmt.trail_lock_premium_points
+        trigger = CONFIG.trade_mgmt.trail_trigger_premium_points
         position = _make_position(state=PositionState.OPEN, sl_placed_at=datetime.now().isoformat())
         position.side = TradeSide.SHORT
         position.entry_price = 35.25
@@ -838,14 +842,15 @@ class TestEntryStateFlow(unittest.TestCase):
         ]
         self.kite.positions.return_value = {"net": [{"tradingsymbol": "TESTCE", "quantity": -50}]}
         self.kite.orders.return_value = []
-        self.get_ltp.return_value = 33.25  # profit = 2.0
+        self.get_ltp.return_value = 35.25 - (trigger + 0.1)  # profit just past trigger
 
         self.mgr._check_position_exit(position.contract.tradingsymbol)
 
-        self.assertAlmostEqual(position.stop_loss, 35.25, places=2)
-        self.kite.modify_order.assert_called_once()
+        self.assertAlmostEqual(position.stop_loss, 35.25 - lock, places=2)
+        self.assertTrue(position.trailing_sl_active)
 
-    def test_trailing_sl_short_moves_sl_to_lock_2pts_at_3pts(self):
+    def test_trailing_sl_short_untouched_below_trigger(self):
+        trigger = CONFIG.trade_mgmt.trail_trigger_premium_points
         position = _make_position(state=PositionState.OPEN, sl_placed_at=datetime.now().isoformat())
         position.side = TradeSide.SHORT
         position.entry_price = 35.25
@@ -862,12 +867,12 @@ class TestEntryStateFlow(unittest.TestCase):
         ]
         self.kite.positions.return_value = {"net": [{"tradingsymbol": "TESTCE", "quantity": -50}]}
         self.kite.orders.return_value = []
-        self.get_ltp.return_value = 32.25  # profit = 3.0
+        self.get_ltp.return_value = 35.25 - (trigger - 0.1)  # profit just below trigger
 
         self.mgr._check_position_exit(position.contract.tradingsymbol)
 
-        self.assertAlmostEqual(position.stop_loss, 33.25, places=2)  # entry - 2 = 33.25
-        self.kite.modify_order.assert_called_once()
+        self.assertAlmostEqual(position.stop_loss, 35.25, places=2)
+        self.assertFalse(position.trailing_sl_active)
 
     def test_trailing_sl_short_does_not_false_trigger(self):
         position = _make_position(state=PositionState.OPEN, sl_placed_at=datetime.now().isoformat())
@@ -886,7 +891,8 @@ class TestEntryStateFlow(unittest.TestCase):
         ]
         self.kite.positions.return_value = {"net": [{"tradingsymbol": "TESTCE", "quantity": -50}]}
         self.kite.orders.return_value = []
-        self.get_ltp.return_value = 33.25  # profit = 2.0, price below SL
+        trigger = CONFIG.trade_mgmt.trail_trigger_premium_points
+        self.get_ltp.return_value = 35.25 - (trigger - 0.1)  # below trigger, price below SL
 
         self.mgr._check_position_exit(position.contract.tradingsymbol)
 
@@ -1140,6 +1146,66 @@ class TestLossCounting(unittest.TestCase):
         self.assertEqual(rm.stats.consecutive_losses, 0)
         self.assertEqual(rm.stats.losses, 1)
         self.assertEqual(rm.stats.wins, 1)
+
+
+class TestAdxBandGate(unittest.TestCase):
+    """Every trade independently needs ADX inside [adx_min, adx_max].
+    There is no comparison against the previous trade."""
+
+    def test_adx_at_floor_is_allowed(self):
+        rm = RiskManager(starting_equity=100000.0)
+        allowed, _ = rm.adx_band_allows(CONFIG.strategy.adx_min)
+        self.assertTrue(allowed)
+
+    def test_adx_below_floor_is_rejected(self):
+        rm = RiskManager(starting_equity=100000.0)
+        allowed, reason = rm.adx_band_allows(CONFIG.strategy.adx_min - 1)
+        self.assertFalse(allowed)
+        self.assertIn("ADX_BELOW_MIN", reason)
+
+    def test_adx_at_ceiling_is_allowed(self):
+        rm = RiskManager(starting_equity=100000.0)
+        allowed, _ = rm.adx_band_allows(CONFIG.strategy.adx_max)
+        self.assertTrue(allowed)
+
+    def test_adx_above_ceiling_is_rejected(self):
+        rm = RiskManager(starting_equity=100000.0)
+        allowed, reason = rm.adx_band_allows(CONFIG.strategy.adx_max + 1)
+        self.assertFalse(allowed)
+        self.assertIn("ADX_ABOVE_MAX", reason)
+
+    def test_same_adx_re_entry_after_decay(self):
+        # Trade 1 at 23, ADX falls to 21 (blocked), returns to 23 -> trade 2 valid
+        rm = RiskManager(starting_equity=100000.0)
+        self.assertTrue(rm.adx_band_allows(23.0)[0])
+        rm.record_trade_result(100.0)
+
+        self.assertFalse(rm.adx_band_allows(21.0)[0])
+        self.assertTrue(rm.adx_band_allows(23.0)[0])
+
+    def test_lower_adx_than_previous_trade_is_allowed(self):
+        # Trade at 26, then ADX returns at 25 -> still eligible, no escalation
+        rm = RiskManager(starting_equity=100000.0)
+        self.assertTrue(rm.adx_band_allows(26.0)[0])
+        rm.record_trade_result(100.0)
+        self.assertTrue(rm.adx_band_allows(25.0)[0])
+        self.assertTrue(rm.adx_band_allows(22.0 + 3)[0])
+
+    def test_band_is_independent_of_trade_count(self):
+        rm = RiskManager(starting_equity=100000.0)
+        for _ in range(4):
+            rm.record_trade_result(100.0)
+        self.assertTrue(rm.adx_band_allows(23.0)[0])
+        self.assertFalse(rm.adx_band_allows(22.9)[0])
+
+    def test_daily_cap_still_applies(self):
+        rm = RiskManager(starting_equity=100000.0)
+        cap = CONFIG.strategy.max_trades_per_day
+        for _ in range(cap):
+            rm.record_trade_result(100.0)
+        allowed, reason = rm.can_take_new_trade()
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "MAX_TRADES_REACHED")
 
 
 class TestReconciliationGuards(unittest.TestCase):

@@ -26,7 +26,7 @@ from indicators import (
     vwap_cross_count,
 )
 from logger import get_logger
-from utils import Signal, TradeSide, Candle, _get_current_session
+from utils import Signal, TradeSide, Candle
 
 _log = get_logger("strategy")
 
@@ -53,15 +53,12 @@ class StrategyEngine:
             return Signal(side=TradeSide.NONE, reason="EMA_NOT_READY")
 
         adx_val = adx(closed_5m, CONFIG.indicators.adx_period)
-        # Use session-specific ADX threshold if available
-        session = _get_current_session()
-        adx_threshold = CONFIG.strategy.session_adx_min.get(session, CONFIG.strategy.adx_min)
+        adx_threshold = CONFIG.strategy.adx_min
         if adx_val is None or adx_val < adx_threshold:
             return Signal(side=TradeSide.NONE, reason="ADX_LOW", confidence_notes=f"adx={adx_val} threshold={adx_threshold}")
 
         atr_val = atr(closed_5m, CONFIG.indicators.atr_period)
-        # Use session-specific ATR threshold if available
-        atr_threshold = CONFIG.strategy.session_atr_min.get(session, CONFIG.strategy.atr_min_points)
+        atr_threshold = CONFIG.strategy.atr_min_points
         if atr_val is None or atr_val < atr_threshold:
             return Signal(side=TradeSide.NONE, reason="ATR_TOO_LOW", confidence_notes=f"atr={atr_val} threshold={atr_threshold}")
 
@@ -102,15 +99,19 @@ class StrategyEngine:
 
             entry_price = current_price
             if CONFIG.trade_mgmt.use_fixed_sl_target:
-                stop_loss = entry_price - CONFIG.trade_mgmt.fixed_sl_distance_index_points
-                sl_distance = CONFIG.trade_mgmt.fixed_sl_distance_index_points
-                target = entry_price + CONFIG.trade_mgmt.fixed_target_distance_index_points
+                sl_distance = CONFIG.trade_mgmt.fixed_sl_premium_points
+                target_distance = CONFIG.trade_mgmt.fixed_target_premium_points
             else:
                 swing_low = min(c.low for c in closed_5m[-5:]) if len(closed_5m) >= 5 else closed_5m[-1].low
                 stop_loss = max(closed_5m[-1].low, swing_low)
                 stop_loss = min(stop_loss, entry_price - CONFIG.trade_mgmt.stop_loss_index_points_cap)
                 sl_distance = entry_price - stop_loss
-                target = entry_price + sl_distance * 2
+                target_distance = sl_distance * 2
+
+            # Distances are OPTION PREMIUM points, applied to the index levels
+            # as a placeholder; main.py rebuilds the real premium prices.
+            stop_loss = entry_price - sl_distance
+            target = entry_price + target_distance
 
             return Signal(
                 side=TradeSide.LONG,
@@ -119,7 +120,9 @@ class StrategyEngine:
                 stop_loss=round(stop_loss, 2),
                 target=round(target, 2),
                 swing_level=ema20_val,
-                confidence_notes=f"adx={adx_val:.1f} atr={atr_val:.1f} rr=1:2",
+                confidence_notes=f"adx={adx_val:.1f} atr={atr_val:.1f} rr=1:1",
+                adx=adx_val,
+                atr=atr_val,
             )
 
         else:
@@ -140,15 +143,19 @@ class StrategyEngine:
 
             entry_price = current_price
             if CONFIG.trade_mgmt.use_fixed_sl_target:
-                stop_loss = entry_price + CONFIG.trade_mgmt.fixed_sl_distance_index_points
-                sl_distance = CONFIG.trade_mgmt.fixed_sl_distance_index_points
-                target = entry_price - CONFIG.trade_mgmt.fixed_target_distance_index_points
+                sl_distance = CONFIG.trade_mgmt.fixed_sl_premium_points
+                target_distance = CONFIG.trade_mgmt.fixed_target_premium_points
             else:
                 swing_high = max(c.high for c in closed_5m[-5:]) if len(closed_5m) >= 5 else closed_5m[-1].high
-                stop_loss = swing_high
-                stop_loss = min(stop_loss, entry_price + CONFIG.trade_mgmt.stop_loss_index_points_cap)
+                stop_loss = max(closed_5m[-1].high, swing_high)
+                stop_loss = max(stop_loss, entry_price + CONFIG.trade_mgmt.stop_loss_index_points_cap)
                 sl_distance = stop_loss - entry_price
-                target = entry_price - sl_distance * 2
+                target_distance = sl_distance * 2
+
+            # Distances are OPTION PREMIUM points, applied to the index levels
+            # as a placeholder; main.py rebuilds the real premium prices.
+            stop_loss = entry_price + sl_distance
+            target = entry_price - target_distance
 
             return Signal(
                 side=TradeSide.SHORT,
@@ -157,5 +164,7 @@ class StrategyEngine:
                 stop_loss=round(stop_loss, 2),
                 target=round(target, 2),
                 swing_level=ema20_val,
-                confidence_notes=f"adx={adx_val:.1f} atr={atr_val:.1f} rr=1:2",
+                confidence_notes=f"adx={adx_val:.1f} atr={atr_val:.1f} rr=1:1",
+                adx=adx_val,
+                atr=atr_val,
             )

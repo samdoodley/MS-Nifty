@@ -108,8 +108,8 @@ class SessionConfig:
     force_square_off_time: time = time(15, 15)
     market_close: time = time(15, 30)
 
-    enable_time_based_entry_gate: bool = True
-    first_entry_time: time = time(12, 30)     # entries blocked until 12:30 IST (Session 1 start)
+    # No session gating: the bot may enter at any time inside the trading window.
+    enable_time_based_entry_gate: bool = False
 
     primary_timeframe_min: int = 5
     higher_timeframe_min: int = 15
@@ -141,9 +141,14 @@ class IndicatorConfig:
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    adx_min: float = 12.0
-    atr_min_points: float = 0.5            # minimum NIFTY-points ATR to trade;
+    # ADX eligibility: every trade independently needs ADX inside this band.
+    # There is no comparison against the previous trade, so ADX may fall
+    # between trades and return to the same band. Example: trade 1 at 23,
+    # ADX drops to 21 (blocked), returns to 23 -> trade 2 is eligible.
+    adx_min: float = 23.0                    # trend must be at least this strong
+    atr_min_points: float = 10.0             # minimum NIFTY-points ATR to trade;
                                                    # below this = too quiet, skip
+    adx_max: float = 32.0                    # no entries once ADX is above this
     ema_flat_slope_lookback: int = 5        # bars used to judge "EMA is flat"
     ema_flat_slope_min_points: float = 1.5  # min EMA20 movement over lookback
                                                    # bars to NOT be considered flat
@@ -158,40 +163,12 @@ class StrategyConfig:
     strong_candle_body_to_range_min_pct: float = 0.25  # body >=25% of candle range
                                                            # to count as "strong"
 
-    max_trades_per_day: int = 32
-
-    # Per-session trade caps
-    session_trades_max: dict = field(default_factory=lambda: {
-        1: 10,   # Session 1: max 10 trades
-        2: 10,   # Session 2: max 10 trades
-        3: 7,    # Session 3: max 7 trades
-        4: 5,    # Session 4: max 5 trades
-    })
-
-    # Per-session profit target in rupees (0 = disabled)
-    session_profit_target: dict = field(default_factory=lambda: {
-        1: 3500,  # Session 1: stop after Rs.3,500 profit
-        2: 3500,  # Session 2: stop after Rs.3,500 profit
-        3: 0,     # Session 3: disabled
-        4: 0,     # Session 4: disabled
-    })
+    # Hard cap on trades per day. With ADX escalation in play the usable
+    # number is usually lower: each trade needs a strictly higher ADX than
+    # the previous one, all within (adx_min, adx_max].
+    max_trades_per_day: int = 5
 
     manual_event_disable: bool = False      # flip True on RBI policy / budget days etc.
-
-    # Per-session ADX/ATR thresholds (override defaults when set)
-    # Session boundaries in IST: S1=12:30-13:50, S2=13:50-14:20, S3=14:20-15:00, S4=15:00-15:25
-    session_adx_min: dict = field(default_factory=lambda: {
-        1: 20.0,   # Session 1: ADX >= 20
-        2: 20.0,   # Session 2: ADX >= 20
-        3: 25.0,   # Session 3: ADX >= 25
-        4: 30.0,   # Session 4: ADX >= 30
-    })
-    session_atr_min: dict = field(default_factory=lambda: {
-        1: 10.0,   # Session 1: ATR >= 10
-        2: 10.0,   # Session 2: ATR >= 10
-        3: 10.0,   # Session 3: ATR >= 10
-        4: 12.0,   # Session 4: ATR >= 12
-    })
 
 
 # ============================================================
@@ -202,21 +179,26 @@ class StrategyConfig:
 
 @dataclass(frozen=True)
 class TradeManagementConfig:
+    """
+    All distances below are OPTION PREMIUM POINTS, not NIFTY index points.
+
+    The bot buys NIFTY options, so every order it places is at an option
+    premium. Example with a 100.00 premium long CE:
+        entry            100.00
+        stop-loss         93.00   (-7 premium points)
+        trail triggers   107.00   (+7 premium points) -> SL moves to 105.00
+        target           110.00   (+10 premium points)
+    """
     target_index_points: float = 10.0
     stop_loss_index_points_cap: float = 3.0   # SL = min(swing_sl, this)
 
-    breakeven_trigger_index_points: float = 6.0
-    breakeven_buffer_points: float = 0.5       # move SL to entry + this (buy side)
-
+    # Single-step trailing: once profit reaches trail_trigger_premium_points,
+    # the SL is moved to lock trail_lock_premium_points of profit.
+    # Measured on the OPTION PREMIUM, since that is what we trade.
     enable_trailing_after_breakeven: bool = True
-    trail_step_index_points: float = 2.0       # every +2 pts beyond breakeven,
-    trail_lock_index_points: float = 1.0       # trail SL up by 1 pt
-
-    # Option premium fallback target/SL if you prefer trading premium directly
-    # instead of translating index points (used only if use_premium_targets=True)
-    use_premium_targets: bool = False
-    premium_target_points: float = 15.0
-    premium_stop_loss_points: float = 12.0
+    trail_trigger_premium_points: float = 7.0
+    trail_lock_premium_points: float = 5.0
+    trail_step_index_points: float = 2.0       # legacy, unused
 
     sl_order_type: str = "SL-M"                # stop-market for guaranteed fill in live
     sl_limit_offset_points: float = 2.0         # limit price = trigger +/- this
@@ -235,9 +217,14 @@ class TradeManagementConfig:
     sl_m_slippage_points: float = 0.5           # expected slippage on SL-M fills
 
     # Fixed SL/Target mode (overrides swing-based 1:2 RR)
+    #
+    # Trade path, in OPTION PREMIUM points from entry (long CE example):
+    #   entry 100.00 -> SL sits at 93.00   (7 points of risk)
+    #   +7     107.00 -> trailing engages, SL moves to 105.00 (locks 5)
+    #   +10    110.00 -> target reached, position closed
     use_fixed_sl_target: bool = True
-    fixed_sl_distance_index_points: float = 4.89          # SL = entry - 4.89 index points (~2.20 premium)
-    fixed_target_distance_index_points: float = 6.67      # target = entry - 6.67 index points (~3.0 premium)
+    fixed_sl_premium_points: float = 7.0        # SL = entry -/+ 7 premium points
+    fixed_target_premium_points: float = 10.0   # target = entry +/+ 10 premium points
 
 
 # ============================================================
